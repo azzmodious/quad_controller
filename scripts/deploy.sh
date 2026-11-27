@@ -2,7 +2,7 @@
 # Update the Pi to the latest code and restart the service.
 #
 # On the Pi:          ~/quad_controller/scripts/deploy.sh
-# From your laptop:   ssh quad-pi '~/quad_controller/scripts/deploy.sh'
+# From your laptop:   ssh drone01 '~/quad_controller/scripts/deploy.sh'
 #
 # Optional: deploy.sh <branch> checks out that branch first.
 set -euo pipefail

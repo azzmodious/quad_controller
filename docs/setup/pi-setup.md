@@ -79,8 +79,8 @@ Follow [remote-access.md](remote-access.md) to put the Pi behind Cloudflare Tunn
 From the Pi, or from your laptop over the tunnel:
 
 ```bash
-ssh quad-pi '~/quad_controller/scripts/deploy.sh'          # latest main
-ssh quad-pi '~/quad_controller/scripts/deploy.sh my-branch' # try a branch
+ssh drone01 '~/quad_controller/scripts/deploy.sh'          # latest main (Host name from your ssh config)
+ssh drone01 '~/quad_controller/scripts/deploy.sh my-branch' # try a branch
 ```
 
 ## Handy commands

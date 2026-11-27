@@ -1,15 +1,15 @@
 # Rendered to /etc/cloudflared/config.yml by scripts/cloudflare_tunnel.sh.
-# @TUNNEL_ID@ and @DOMAIN@ are filled in by the script.
+# @TUNNEL_ID@, @SSH_HOST@ and @DASH_HOST@ are filled in by the script.
 tunnel: @TUNNEL_ID@
 credentials-file: /etc/cloudflared/@TUNNEL_ID@.json
 
 ingress:
   # SSH into the Pi (browser SSH, or `cloudflared access ssh` from the laptop).
-  - hostname: ssh.@DOMAIN@
+  - hostname: @SSH_HOST@
     service: ssh://localhost:22
   # The dashboard from Phase 2. Nothing listens on 8000 yet, so this returns
   # a 502 behind the Access login until then. That is expected.
-  - hostname: quad.@DOMAIN@
+  - hostname: @DASH_HOST@
     service: http://localhost:8000
   # Anything else gets a 404.
   - service: http_status:404
