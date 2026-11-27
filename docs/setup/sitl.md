@@ -57,6 +57,6 @@ quadctl check --connection tcp:127.0.0.1:5760
 `.github/workflows/ci.yml` runs lint and unit tests, then starts SITL with `scripts/sitl.sh --background` and runs `pytest -m sitl`:
 
 * Phase 0: a heartbeat within 5 seconds; mode and battery logged.
-* Phase 1 (`tests/sitl/test_sitl_phase1.py`): our state matches an independent pymavlink reader on MAVProxy's second port; the test takes off to 10 m, flies CIRCLE for 30 s and checks heading, bank and position follow; it records the flight and replays it; then it freezes SITL with `SIGSTOP` and checks `link_lost` within 3 s and `link_restored` after `SIGCONT`.
+* Phase 1 (`tests/sitl/test_sitl_phase1.py`): our state matches an independent pymavlink reader on MAVProxy's second port; the test takes off to 10 m, flies a 25 s circle in GUIDED with velocity setpoints and checks heading, bank and position follow; it records the flight and replays it; then it freezes SITL with `SIGSTOP` and checks `link_lost` within 3 s and `link_restored` after `SIGCONT`.
 
 The Phase 1 test flies, so run it on a fresh SITL (`./scripts/sitl.sh --stop`, delete `.sitl/eeprom.bin`, start again) if you run the SITL tests twice in a row.

@@ -60,26 +60,36 @@ def _independent_sample(kinds=("ATTITUDE", "GLOBAL_POSITION_INT"), timeout=5.0):
     return got
 
 
-def _set_param(link, name, value):
+async def _fly_circle(link, speed=3.0, turn_dps=20.0):
+    """GUIDED velocity setpoints whose direction turns at turn_dps (radius ~8.6 m).
+
+    Guided velocity commands time out after a few seconds, so keep sending at 5 Hz.
+    """
     from pymavlink import mavutil
 
-    link.send(
-        lambda m: m.param_set_send(
-            link.target_system,
-            link.target_component,
-            name.encode(),
-            float(value),
-            mavutil.mavlink.MAV_PARAM_TYPE_REAL32,
-        )
-    )
-
-
-async def _hold_throttle_mid(link):
-    ignore = 65535  # UINT16_MAX: leave that channel alone
+    ignore_pos_acc_yawrate = 0b1001_1100_0111
+    t0 = time.monotonic()
     while True:
+        direction = math.radians((time.monotonic() - t0) * turn_dps)
+        vn, ve = speed * math.cos(direction), speed * math.sin(direction)
         link.send(
-            lambda m: m.rc_channels_override_send(
-                link.target_system, link.target_component, 0, 0, 1500, 0, *([ignore] * 4)
+            lambda m, vn=vn, ve=ve, yaw=direction: m.set_position_target_local_ned_send(
+                0,
+                link.target_system,
+                link.target_component,
+                mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+                ignore_pos_acc_yawrate,
+                0,
+                0,
+                0,
+                vn,
+                ve,
+                0,
+                0,
+                0,
+                0,
+                yaw,
+                0,
             )
         )
         await asyncio.sleep(0.2)
@@ -135,15 +145,12 @@ async def _flight(cfg, tmp_path):
             assert (await cmds.takeoff(10)).ok
             await _until(lambda: (s.position.alt_rel_m or 0) > 9.0, 40, "takeoff to 10 m")
 
-            # CIRCLE takes climb rate from the throttle stick, which SITL leaves at
-            # 1000 (full descent). Hold it mid-stick with an RC override (SITL only).
-            # ArduPilot only takes overrides from SYSID_MYGCS, so point that at us.
-            _set_param(link, "SYSID_MYGCS", link.source_system)
-            hold = asyncio.create_task(_hold_throttle_mid(link))
-            assert (await cmds.set_mode("CIRCLE")).ok
-            await _until(lambda: s.heartbeat.mode == "CIRCLE", 5, "CIRCLE mode")
+            # Fly the circle ourselves in GUIDED with velocity setpoints. (CIRCLE mode
+            # takes climb rate from the throttle stick, which SITL leaves at 1000, and
+            # the RC-override workaround depends on a param renamed across versions.)
+            circling = asyncio.create_task(_fly_circle(link))
             headings, rolls, lats = [], [], []
-            t_end = time.monotonic() + 30  # first few seconds: flying out to the radius
+            t_end = time.monotonic() + 25
             while time.monotonic() < t_end:
                 headings.append(s.attitude.heading_deg)
                 rolls.append(abs(s.attitude.roll_deg))
@@ -156,16 +163,15 @@ async def _flight(cfg, tmp_path):
             assert max(lats) - min(lats) > 2e-5, "position did not move"
             assert abs(s.position.alt_rel_m - 10) < 2.0
 
+            circling.cancel()
             assert (await cmds.set_mode("LAND")).ok
-            hold.cancel()
-            _set_param(link, "SYSID_MYGCS", 255)
 
         # 3. Replay what we recorded.
         _header, frames = read_recording(rec_path)
         frames = list(frames)
         assert len(frames) > 150
         modes = {f.state.heartbeat.mode for f in frames}
-        assert {"GUIDED", "CIRCLE"} <= modes
+        assert "GUIDED" in modes and any(f.state.heartbeat.armed for f in frames)
         assert max(f.state.position.alt_rel_m or 0 for f in frames) > 9.0
 
         # 4. Freeze SITL and watch the watchdog.
