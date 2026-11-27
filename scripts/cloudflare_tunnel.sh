@@ -113,10 +113,14 @@ do_verify() {
   set_names "$1" "${2:-}"
   for host in "$SSH_HOST" "$DASH_HOST"; do
     # Behind Access, an anonymous request is redirected to the Access login page.
-    local code location
-    code="$(curl -s -o /dev/null -w '%{http_code}' "https://$host/")"
-    location="$(curl -s -o /dev/null -w '%{redirect_url}' "https://$host/")"
-    if [[ "$code" =~ ^30[0-9]$ && "$location" == *cloudflareaccess.com* ]]; then
+    local out rc=0 code location
+    out="$(curl -s -o /dev/null --max-time 15 -w '%{http_code} %{redirect_url}' "https://$host/")" || rc=$?
+    code="${out%% *}"
+    location="${out#* }"
+    if [[ $rc -ne 0 ]]; then
+      echo "FAIL  $host could not be reached (curl exit $rc). Check DNS and that cloudflared is running."
+      ok=0
+    elif [[ "$code" =~ ^30[0-9]$ && "$location" == *cloudflareaccess.com* ]]; then
       echo "OK    $host requires an Access login"
     else
       echo "FAIL  $host answered HTTP $code without an Access login. Set up Access before going further."
