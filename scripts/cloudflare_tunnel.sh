@@ -2,26 +2,44 @@
 # Cloudflare Tunnel for the Pi: no open ports on your home router, nothing
 # public until Cloudflare Access lets you in.
 #
-#   ./scripts/cloudflare_tunnel.sh install            install cloudflared from Cloudflare's apt repo
-#   ./scripts/cloudflare_tunnel.sh create <domain>    log in, create tunnel "quad", DNS for
-#                                                     ssh.<domain> and quad.<domain>, run as a service
-#   ./scripts/cloudflare_tunnel.sh verify <domain>    check both hostnames demand an Access login
+#   ./scripts/cloudflare_tunnel.sh install                   install cloudflared from Cloudflare's apt repo
+#   ./scripts/cloudflare_tunnel.sh create <domain> [name]    log in, create a tunnel called <name>, DNS for
+#                                                            <name>.<domain> (dashboard) and
+#                                                            <name>-ssh.<domain> (SSH), run as a service
+#   ./scripts/cloudflare_tunnel.sh verify <domain> [name]    check both hostnames demand an Access login
 #   ./scripts/cloudflare_tunnel.sh ssh-ca <principal> "<ca public key>"
-#                                                     trust Cloudflare's short-lived SSH certs for
-#                                                     browser SSH; <principal> is the part of your
-#                                                     Access email before the @
-#   ./scripts/cloudflare_tunnel.sh status             service and tunnel status
+#                                                            trust Cloudflare's short-lived SSH certs for
+#                                                            browser SSH; <principal> is the part of
+#                                                            your Access email before the @
+#   ./scripts/cloudflare_tunnel.sh status [name]             service and tunnel status
+#
+# <name> is this drone's name and defaults to "quad". Example:
+#   ./scripts/cloudflare_tunnel.sh create example.com drone01
+#   -> drone01.example.com and drone01-ssh.example.com
+# One level of subdomain keeps both names covered by Cloudflare's free certificate.
 #
 # Run on the Pi as your normal user; it uses sudo where needed.
 # Full walk-through, including the Access setup in the dashboard: docs/setup/remote-access.md
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TUNNEL_NAME="${TUNNEL_NAME:-quad}"
+DEFAULT_NAME="quad"
+
+# Sets NAME, DASH_HOST and SSH_HOST from <domain> [name].
+set_names() {
+  local domain="$1"
+  NAME="${2:-$DEFAULT_NAME}"
+  if [[ ! "$NAME" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]]; then
+    echo "name must be lowercase letters, digits and dashes, e.g. drone01" >&2
+    exit 2
+  fi
+  DASH_HOST="$NAME.$domain"
+  SSH_HOST="$NAME-ssh.$domain"
+}
 
 need_domain() {
   if [[ -z "${1:-}" ]]; then
-    echo "usage: $0 $cmd <domain>   e.g. $0 $cmd example.com" >&2
+    echo "usage: $0 $cmd <domain> [name]   e.g. $0 $cmd example.com drone01" >&2
     exit 2
   fi
 }
@@ -43,6 +61,7 @@ do_install() {
 
 do_create() {
   local domain="$1"
+  set_names "$1" "${2:-}"
   command -v cloudflared >/dev/null || do_install
 
   if [[ ! -f "$HOME/.cloudflared/cert.pem" ]]; then
@@ -51,20 +70,20 @@ do_create() {
     cloudflared tunnel login
   fi
 
-  if ! cloudflared tunnel info "$TUNNEL_NAME" >/dev/null 2>&1; then
-    cloudflared tunnel create "$TUNNEL_NAME"
+  if ! cloudflared tunnel info "$NAME" >/dev/null 2>&1; then
+    cloudflared tunnel create "$NAME"
   fi
   local id
-  id="$(cloudflared tunnel list --name "$TUNNEL_NAME" --output json \
+  id="$(cloudflared tunnel list --name "$NAME" --output json \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')"
-  echo "Tunnel $TUNNEL_NAME has id $id"
+  echo "Tunnel $NAME has id $id"
 
-  cloudflared tunnel route dns --overwrite-dns "$TUNNEL_NAME" "ssh.$domain"
-  cloudflared tunnel route dns --overwrite-dns "$TUNNEL_NAME" "quad.$domain"
+  cloudflared tunnel route dns --overwrite-dns "$NAME" "$SSH_HOST"
+  cloudflared tunnel route dns --overwrite-dns "$NAME" "$DASH_HOST"
 
   sudo mkdir -p /etc/cloudflared
   sudo install -m 0600 "$HOME/.cloudflared/$id.json" "/etc/cloudflared/$id.json"
-  sed -e "s|@TUNNEL_ID@|$id|g" -e "s|@DOMAIN@|$domain|g" \
+  sed -e "s|@TUNNEL_ID@|$id|g" -e "s|@SSH_HOST@|$SSH_HOST|g" -e "s|@DASH_HOST@|$DASH_HOST|g" \
     "$ROOT/deploy/cloudflared/config.yml.template" | sudo tee /etc/cloudflared/config.yml >/dev/null
   sudo cloudflared --config /etc/cloudflared/config.yml ingress validate
 
@@ -82,13 +101,17 @@ do_create() {
 Tunnel is up. Before you use it, protect both hostnames with Cloudflare Access
 (docs/setup/remote-access.md, "Cloudflare Access"). Then run:
 
-  $0 verify $domain
+  $0 verify $domain $NAME
+
+Hostnames:  dashboard  https://$DASH_HOST
+            SSH        https://$SSH_HOST
 MSG
 }
 
 do_verify() {
-  local domain="$1" ok=1
-  for host in "ssh.$domain" "quad.$domain"; do
+  local ok=1
+  set_names "$1" "${2:-}"
+  for host in "$SSH_HOST" "$DASH_HOST"; do
     # Behind Access, an anonymous request is redirected to the Access login page.
     local code location
     code="$(curl -s -o /dev/null -w '%{http_code}' "https://$host/")"
@@ -125,21 +148,22 @@ CONF
 }
 
 do_status() {
+  NAME="${1:-$DEFAULT_NAME}"
   systemctl --no-pager --lines=10 status cloudflared || true
-  cloudflared tunnel info "$TUNNEL_NAME" || true
+  cloudflared tunnel info "$NAME" || true
 }
 
 cmd="${1:-}"
 case "$cmd" in
   install) do_install ;;
-  create) need_domain "${2:-}"; do_create "$2" ;;
-  verify) need_domain "${2:-}"; do_verify "$2" ;;
+  create) need_domain "${2:-}"; do_create "$2" "${3:-}" ;;
+  verify) need_domain "${2:-}"; do_verify "$2" "${3:-}" ;;
   ssh-ca)
     if [[ $# -lt 3 ]]; then
       echo "usage: $0 ssh-ca <principal> \"<ca public key>\"" >&2
       exit 2
     fi
     do_ssh_ca "$2" "$3" ;;
-  status) do_status ;;
-  *) sed -n '2,15p' "$0"; exit 2 ;;
+  status) do_status "${2:-}" ;;
+  *) sed -n '2,21p' "$0"; exit 2 ;;
 esac
