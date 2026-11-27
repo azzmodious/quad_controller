@@ -1,0 +1,6 @@
+# Pixhawk params for the Pi 5 companion link on TELEM2.
+# Load in Mission Planner: Config > Full Parameter List > Load from file > Write Params.
+# Then reboot the Pixhawk. See docs/hardware/pixhawk-params.md.
+SERIAL2_PROTOCOL,2
+SERIAL2_BAUD,921
+BRD_SER2_RTSCTS,0
