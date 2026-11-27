@@ -37,3 +37,14 @@ def test_rotation(tmp_path):
     out = io.StringIO()
     show(tmp_path, out, tail=1)
     assert "i=99" in out.getvalue()
+
+
+def test_viewer_shows_local_time():
+    from datetime import UTC, datetime
+
+    from quad_controller.logview import local_time
+
+    utc = datetime(2026, 11, 27, 18, 0, 0, 123000, tzinfo=UTC)
+    assert local_time(utc.isoformat(timespec="milliseconds")) == utc.astimezone().strftime(
+        "%H:%M:%S.123"
+    )

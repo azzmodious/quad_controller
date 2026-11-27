@@ -71,3 +71,39 @@ def test_helpers():
     assert flash_hint(["ArduCopter V4.5.7", "Pixhawk1-1M 003A0029"]).startswith("1 MB")
     assert flash_hint(["ArduCopter V4.5.7", "Pixhawk1 003A0029"]).startswith("2 MB")
     assert flash_hint(["ArduCopter V4.5.7"]).startswith("unknown")
+
+
+def test_check_over_serial_port(log_dir):
+    """The Pixhawk link is a serial port; make sure that path works (needs pyserial)."""
+    import os
+    import threading
+    import time
+
+    from tests.fake_autopilot import COPTER_LOITER, mavlink
+
+    master, slave = os.openpty()
+    stop = threading.Event()
+
+    def feed():
+        mav = mavlink.MAVLink(None, srcSystem=1, srcComponent=1)
+        while not stop.is_set():
+            msg = mav.heartbeat_encode(
+                mavlink.MAV_TYPE_QUADROTOR,
+                mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA,
+                mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                COPTER_LOITER,
+                mavlink.MAV_STATE_STANDBY,
+            )
+            os.write(master, msg.pack(mav))
+            time.sleep(0.1)
+
+    t = threading.Thread(target=feed, daemon=True)
+    t.start()
+    try:
+        rc = main(["check", "--connection", os.ttyname(slave), "--timeout", "5"])
+    finally:
+        stop.set()
+        t.join(timeout=2)
+        os.close(master)
+        os.close(slave)
+    assert rc == 0

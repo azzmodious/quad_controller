@@ -6,6 +6,7 @@ import json
 import logging
 import time
 from collections.abc import Iterable, Iterator
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -45,10 +46,17 @@ def matches(entry: dict[str, Any], min_level: str | None, grep: str | None) -> b
     return not (grep and grep.lower() not in json.dumps(entry).lower())
 
 
+def local_time(ts: str) -> str:
+    """2026-11-27T18:00:00.123+00:00 -> 13:00:00.123 in the Pi's local time zone."""
+    try:
+        dt = datetime.fromisoformat(ts)
+    except ValueError:
+        return ts
+    return dt.astimezone().strftime("%H:%M:%S.%f")[:-3]
+
+
 def render(entry: dict[str, Any]) -> str:
-    ts = str(entry.get("ts", ""))
-    # 2026-11-27T16:00:00.123+00:00 -> 16:00:00.123
-    short_ts = ts[11:23] if len(ts) >= 23 else ts
+    short_ts = local_time(str(entry.get("ts", "")))
     extra = " ".join(f"{k}={v}" for k, v in entry.items() if k not in _CORE)
     line = f"{short_ts} {entry.get('level', ''):<7} {entry.get('event', '')}"
     return f"{line} {extra}" if extra else line
