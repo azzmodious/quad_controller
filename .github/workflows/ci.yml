@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # matches Raspberry Pi OS Bookworm
+          cache: pip
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: pytest -q
+
+  sitl:
+    name: SITL heartbeat
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -e ".[dev,sitl]"
+      - name: Start ArduCopter SITL + MAVProxy
+        run: ./scripts/sitl.sh --background
+      - name: Heartbeat within 5 s, mode and battery logged
+        run: QC_SITL=1 pytest -q -m sitl
+      - name: SITL logs
+        if: always()
+        run: |
+          echo "--- arducopter.log"; tail -n 50 .sitl/arducopter.log || true
+          echo "--- mavproxy.log"; tail -n 50 .sitl/mavproxy.log || true
+      - name: Stop SITL
+        if: always()
+        run: ./scripts/sitl.sh --stop
