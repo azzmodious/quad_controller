@@ -1,0 +1,25 @@
+# Installed by scripts/install_service.sh, which fills in @USER@ and @REPO@.
+[Unit]
+Description=Quad controller (MAVLink companion for the Pixhawk)
+After=network-online.target
+Wants=network-online.target
+# Give up restarting only after 10 crashes in 5 minutes.
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=@USER@
+Group=@USER@
+SupplementaryGroups=dialout
+WorkingDirectory=@REPO@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@REPO@/.venv/bin/quadctl run --target hardware
+Restart=on-failure
+RestartSec=3
+# The JSON log goes to /var/log/quad_controller; console output goes to journald.
+LogsDirectory=quad_controller
+LogsDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
