@@ -1,6 +1,9 @@
 """`quadctl` command line.
 
-quadctl run              connect and log heartbeat, mode and battery (the Phase 0 service)
+quadctl run              connect, keep the link alive and log status (the systemd service)
+quadctl telemetry        live terminal view of attitude, GPS, battery, RC and messages
+quadctl record           save telemetry to a file at 10 Hz
+quadctl replay <file>    play a recording back in the terminal view
 quadctl check            exit 0 if an autopilot heartbeat arrives in time, else 1
 quadctl firmware-info    print board, firmware version and boot banner
 quadctl logs             view the JSON-lines log
@@ -10,6 +13,8 @@ quadctl config           print the resolved configuration
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import json
 import logging
 import signal
@@ -37,6 +42,24 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("run", parents=[common], help="connect and log vehicle status")
     p.add_argument("--duration", type=float, help="stop after this many seconds")
+    p.add_argument(
+        "--record", nargs="?", const="auto", help="also record telemetry (optional file name)"
+    )
+
+    p = sub.add_parser("telemetry", parents=[common], help="live terminal telemetry view")
+    p.add_argument("--record", nargs="?", const="auto", help="also record (optional file name)")
+    p.add_argument("--duration", type=float, help="stop after this many seconds")
+    p.add_argument("--no-screen", action="store_true", help="draw inline, not full screen")
+
+    p = sub.add_parser("record", parents=[common], help="record telemetry to a file")
+    p.add_argument("--out", help="file (.jsonl or .jsonl.gz); default: recordings folder")
+    p.add_argument("--duration", type=float, help="stop after this many seconds")
+    p.add_argument("--rate", type=float, help="frames per second (default: config, 10)")
+
+    p = sub.add_parser("replay", parents=[common], help="play a recording in the terminal view")
+    p.add_argument("file")
+    p.add_argument("--speed", type=float, default=1.0, help="playback speed multiplier")
+    p.add_argument("--no-screen", action="store_true", help="draw inline, not full screen")
 
     p = sub.add_parser("check", parents=[common], help="wait for an autopilot heartbeat")
     p.add_argument("--timeout", type=float, help="seconds to wait (default: config)")
@@ -56,21 +79,68 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-class _Stop:
-    def __init__(self) -> None:
-        self.requested = False
-        signal.signal(signal.SIGTERM, self._handle)
-        signal.signal(signal.SIGINT, self._handle)
+def _stop_event() -> asyncio.Event:
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, RuntimeError):  # Windows
+            loop.add_signal_handler(sig, stop.set)
+    return stop
 
-    def _handle(self, signum, _frame) -> None:
-        self.requested = True
+
+async def _wait(stop: asyncio.Event, seconds: float) -> None:
+    with contextlib.suppress(TimeoutError):
+        await asyncio.wait_for(stop.wait(), seconds)
+
+
+def _open_link(cfg: Config):
+    from quad_controller.commands import CommandSender
+    from quad_controller.link import MavLink
+
+    link = MavLink.from_config(cfg)
+    # The service and the telemetry tools never fly the aircraft.
+    CommandSender(link, allow_flight_commands=False)
+    return link
+
+
+def status_fields(link) -> dict:
+    s = link.state
+    age = link.watchdog.rx_age()
+    return {
+        "link": str(link.watchdog.status),
+        "mode": s.heartbeat.mode,
+        "armed": s.heartbeat.armed,
+        "state": s.heartbeat.system_status,
+        "voltage_v": s.battery.voltage_v,
+        "current_a": s.battery.current_a,
+        "battery_pct": s.battery.remaining_pct,
+        "roll_deg": s.attitude.roll_deg,
+        "pitch_deg": s.attitude.pitch_deg,
+        "heading_deg": s.attitude.heading_deg,
+        "gps_fix": s.gps.fix_name,
+        "sats": s.gps.satellites,
+        "alt_rel_m": s.position.alt_rel_m,
+        "hb_age_s": None if age is None else round(age, 2),
+    }
+
+
+def _recording_path(cfg: Config, value: str | None):
+    from quad_controller.recorder import default_recording_path
+
+    if value in (None, "auto", ""):
+        return default_recording_path(cfg)
+    return Path(value).expanduser()
 
 
 def cmd_run(cfg: Config, args) -> int:
-    from quad_controller import mavlink as ml
+    return asyncio.run(_run(cfg, args))
 
-    stop = _Stop()
-    started = time.monotonic()
+
+async def _run(cfg: Config, args) -> int:
+    from quad_controller.recorder import Recorder
+    from quad_controller.watchdog import LinkStatus
+
+    stop = _stop_event()
     log_event(
         log,
         logging.INFO,
@@ -79,78 +149,163 @@ def cmd_run(cfg: Config, args) -> int:
         connection=cfg.target.connection,
         version=__version__,
     )
-    conn = None
-    while conn is None and not stop.requested:
-        try:
-            conn = ml.open_connection(cfg)
-        except OSError as exc:
-            log_event(log, logging.WARNING, "connect_failed", reason=str(exc))
-            time.sleep(2.0)
-    if conn is None:
-        return 0
-    snap = ml.Snapshot()
-    link_up = False
-    last_hb_sent = last_status = last_stream_req = 0.0
-    timeout = cfg.mavlink.heartbeat_timeout_s
+    link = _open_link(cfg)
+    last = {"mode": None, "armed": None}
 
-    while not stop.requested:
-        now = time.monotonic()
-        if args.duration is not None and now - started >= args.duration:
-            break
-        if now - last_hb_sent >= 1.0:
-            ml.send_companion_heartbeat(conn)
-            last_hb_sent = now
+    def on_message(msg) -> None:
+        if msg.get_type() != "HEARTBEAT" or link.state.heartbeat.count == 0:
+            return
+        hb = link.state.heartbeat
+        if last["mode"] is not None and (hb.mode, hb.armed) != (last["mode"], last["armed"]):
+            log_event(log, logging.INFO, "mode_change", **status_fields(link))
+        last["mode"], last["armed"] = hb.mode, hb.armed
 
+    link.subscribe(on_message)
+    started = time.monotonic()
+    recorder = None
+    async with link:
+        if args.record is not None:
+            path = _recording_path(cfg, args.record)
+            recorder = Recorder(link, path, cfg.recorder.rate_hz, target=cfg.target.name)
+            recorder.start()
+            log_event(log, logging.INFO, "recording", path=str(path))
         try:
-            msg = conn.recv_match(
-                type=["HEARTBEAT", "SYS_STATUS", "STATUSTEXT"], blocking=True, timeout=0.2
-            )
-        except OSError as exc:
-            # SITL restarted or USB serial unplugged: report, back off, keep going.
-            log_event(log, logging.WARNING, "link_error", reason=str(exc))
-            time.sleep(1.0)
-            msg = None
-        if msg is not None:
-            if msg.get_type() == "STATUSTEXT":
-                log_event(log, logging.INFO, "statustext", text=msg.text, severity=msg.severity)
-            changed = snap.update(msg)
-            if msg.get_type() == "HEARTBEAT" and ml.is_autopilot_heartbeat(msg):
-                conn.target_system = msg.get_srcSystem()
-                conn.target_component = msg.get_srcComponent()
-                if not link_up:
-                    link_up = True
+            while not stop.is_set():
+                remaining = None
+                if args.duration is not None:
+                    remaining = args.duration - (time.monotonic() - started)
+                    if remaining <= 0:
+                        break
+                interval = cfg.mavlink.status_interval_s
+                await _wait(stop, interval if remaining is None else min(interval, remaining))
+                if stop.is_set():
+                    break
+                if link.watchdog.status is LinkStatus.WAITING:
                     log_event(
-                        log,
-                        logging.INFO,
-                        "link_up",
-                        sysid=conn.target_system,
-                        compid=conn.target_component,
-                        **snap.fields(),
+                        log, logging.INFO, "waiting_for_heartbeat", connection=cfg.target.connection
                     )
-                    last_stream_req = 0.0
-                elif changed:
-                    log_event(log, logging.INFO, "mode_change", **snap.fields())
+                elif link.watchdog.status is not LinkStatus.LOST:
+                    log_event(log, logging.INFO, "status", **status_fields(link))
+        finally:
+            if recorder is not None:
+                await recorder.stop()
+    log_event(log, logging.INFO, "stopped", heartbeats=link.state.heartbeat.count)
+    return 0
 
-        now = time.monotonic()
-        age = snap.heartbeat_age(now)
-        if link_up and age is not None and age > timeout:
-            link_up = False
-            log_event(log, logging.WARNING, "link_lost", hb_age_s=round(age, 1))
-        if link_up and now - last_stream_req >= 10.0:
-            # Ask for battery data each 10 s; harmless if already streaming.
-            ml.request_message_interval(conn, ml.mavlink.MAVLINK_MSG_ID_SYS_STATUS, 1.0)
-            last_stream_req = now
-        if now - last_status >= cfg.mavlink.status_interval_s:
-            last_status = now
-            if link_up:
-                log_event(log, logging.INFO, "status", **snap.fields())
-            elif snap.last_heartbeat is None:
-                log_event(
-                    log, logging.INFO, "waiting_for_heartbeat", connection=cfg.target.connection
-                )
 
-    ml.close_quietly(conn)
-    log_event(log, logging.INFO, "stopped", heartbeats=snap.heartbeats)
+def cmd_telemetry(cfg: Config, args) -> int:
+    return asyncio.run(_telemetry(cfg, args))
+
+
+def _waiting_hint(cfg: Config, link, waited: float) -> str | None:
+    from quad_controller.link import is_serial
+    from quad_controller.watchdog import LinkStatus
+
+    status = link.watchdog.status
+    if status is LinkStatus.WAITING and waited > 5:
+        hint = f"No heartbeat on {cfg.target.connection} yet."
+        if is_serial(cfg.target.connection):
+            hint += (
+                " If the quad-controller service is running it holds this port:"
+                " sudo systemctl stop quad-controller"
+            )
+        return hint
+    if status is LinkStatus.LOST:
+        return "Link lost. Check the cable and the Pixhawk power; reconnecting by itself."
+    return None
+
+
+async def _telemetry(cfg: Config, args) -> int:
+    from rich.console import Console
+    from rich.live import Live
+
+    from quad_controller.recorder import Recorder
+    from quad_controller.tui import LinkInfo, render
+
+    stop = _stop_event()
+    console = Console()
+    link = _open_link(cfg)
+    started = time.monotonic()
+    recorder = None
+    async with link:
+        info = LinkInfo(connection=cfg.target.connection, target=cfg.target.name)
+        if args.record is not None:
+            path = _recording_path(cfg, args.record)
+            recorder = Recorder(link, path, cfg.recorder.rate_hz, target=cfg.target.name)
+            recorder.start()
+            info.recording = path.name
+        try:
+            with Live(console=console, refresh_per_second=10, screen=not args.no_screen) as live:
+                while not stop.is_set():
+                    if args.duration is not None and time.monotonic() - started >= args.duration:
+                        break
+                    info.status = str(link.watchdog.status)
+                    info.rx_age_s = link.watchdog.rx_age()
+                    info.tx_age_s = link.watchdog.tx_age()
+                    info.hint = _waiting_hint(cfg, link, time.monotonic() - started)
+                    live.update(render(link.state, info, width=console.width))
+                    await _wait(stop, 0.1)
+        finally:
+            if recorder is not None:
+                await recorder.stop()
+                console.print(f"Saved {recorder.frames} frames to {recorder.path}")
+    return 0
+
+
+def cmd_record(cfg: Config, args) -> int:
+    return asyncio.run(_record(cfg, args))
+
+
+async def _record(cfg: Config, args) -> int:
+    from quad_controller.recorder import Recorder
+
+    stop = _stop_event()
+    link = _open_link(cfg)
+    path = _recording_path(cfg, args.out)
+    async with link:
+        if not await link.wait_connected(cfg.mavlink.heartbeat_timeout_s):
+            log_event(log, logging.ERROR, "record_failed", reason="no heartbeat")
+            return 1
+        async with Recorder(
+            link, path, args.rate or cfg.recorder.rate_hz, target=cfg.target.name
+        ) as rec:
+            log_event(log, logging.INFO, "recording", path=str(path))
+            await _wait(stop, args.duration if args.duration is not None else 1e9)
+    log_event(log, logging.INFO, "recorded", path=str(path), frames=rec.frames)
+    print(path)
+    return 0
+
+
+def cmd_replay(cfg: Config, args) -> int:
+    return asyncio.run(_replay(args))
+
+
+async def _replay(args) -> int:
+    from rich.console import Console
+    from rich.live import Live
+
+    from quad_controller.recorder import read_recording, replay
+    from quad_controller.tui import LinkInfo, render
+
+    stop = _stop_event()
+    try:
+        header, _frames = read_recording(args.file)
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    console = Console()
+    info = LinkInfo(
+        connection=str(header.get("connection") or ""),
+        target=str(header.get("target") or ""),
+        source="replay",
+    )
+    with Live(console=console, refresh_per_second=10, screen=not args.no_screen) as live:
+        async for frame in replay(args.file, speed=args.speed):
+            if stop.is_set():
+                break
+            info.status = frame.link
+            info.rx_age_s = frame.state.heartbeat.age()
+            live.update(render(frame.state, info, width=console.width))
     return 0
 
 
@@ -279,6 +434,9 @@ def cmd_config(cfg: Config, _args) -> int:
 
 COMMANDS = {
     "run": cmd_run,
+    "telemetry": cmd_telemetry,
+    "record": cmd_record,
+    "replay": cmd_replay,
     "check": cmd_check,
     "firmware-info": cmd_firmware_info,
     "logs": cmd_logs,
@@ -294,7 +452,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
     if args.command not in ("logs", "config"):
-        setup_logging(cfg.logging, console=cfg.logging.console)
+        # Full-screen views keep log lines off the console; the file still gets them.
+        quiet = args.command in ("telemetry", "replay")
+        setup_logging(cfg.logging, console=cfg.logging.console and not quiet)
     return COMMANDS[args.command](cfg, args)
 
 

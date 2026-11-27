@@ -14,7 +14,8 @@ pip install -e ".[dev,sitl]"
 
 ./scripts/sitl.sh --background     # downloads SITL the first time, then starts SITL + MAVProxy
 quadctl check --target sitl         # "check_ok ... mode=STABILIZE"
-quadctl run --target sitl           # live status lines; Ctrl+C to stop
+quadctl telemetry --target sitl     # live terminal view; Ctrl+C to quit
+quadctl run --target sitl           # status lines in the log, like the Pi service
 ./scripts/sitl.sh --stop
 ```
 
@@ -53,4 +54,9 @@ quadctl check --connection tcp:127.0.0.1:5760
 
 ## In CI
 
-`.github/workflows/ci.yml` runs lint and unit tests, then starts SITL with `scripts/sitl.sh --background` and runs `pytest -m sitl`: the skeleton must see a heartbeat within 5 seconds and log mode and battery.
+`.github/workflows/ci.yml` runs lint and unit tests, then starts SITL with `scripts/sitl.sh --background` and runs `pytest -m sitl`:
+
+* Phase 0: a heartbeat within 5 seconds; mode and battery logged.
+* Phase 1 (`tests/sitl/test_sitl_phase1.py`): our state matches an independent pymavlink reader on MAVProxy's second port; the test takes off to 10 m, flies CIRCLE for 30 s and checks heading, bank and position follow; it records the flight and replays it; then it freezes SITL with `SIGSTOP` and checks `link_lost` within 3 s and `link_restored` after `SIGCONT`.
+
+The Phase 1 test flies, so run it on a fresh SITL (`./scripts/sitl.sh --stop`, delete `.sitl/eeprom.bin`, start again) if you run the SITL tests twice in a row.

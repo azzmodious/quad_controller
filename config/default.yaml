@@ -25,6 +25,27 @@ mavlink:
   heartbeat_timeout_s: 5.0
   status_interval_s: 2.0  # how often `quadctl run` logs a status line
 
+link:
+  heartbeat_hz: 1.0        # our companion-computer heartbeat to the Pixhawk
+  # Watchdog: the link is "degraded" when the newest heartbeat (either way) is
+  # older than this, and "lost" after lost_after_s. First guesses; tune on the bench.
+  degraded_after_s: 1.0
+  lost_after_s: 3.0
+  # Messages we ask the Pixhawk for, in Hz. In local.yaml list only the ones you
+  # want to change; 0 means "don't ask for it".
+  streams:
+    ATTITUDE: 20
+    GLOBAL_POSITION_INT: 5
+    GPS_RAW_INT: 2
+    SYS_STATUS: 2
+    VFR_HUD: 4
+    EKF_STATUS_REPORT: 2
+    RC_CHANNELS: 5
+
+recorder:
+  dir: ""       # empty: a "recordings" folder next to the logs
+  rate_hz: 10
+
 logging:
   # Empty dir means: /var/log/quad_controller when it is writable (the Pi service),
   # otherwise ~/.local/state/quad_controller/logs.

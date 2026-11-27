@@ -12,6 +12,7 @@ dependencies = [
     "pymavlink>=2.4.41",
     "pyserial>=3.5",  # pymavlink needs it for serial links (the Pixhawk UART) but does not require it
     "PyYAML>=6.0",
+    "rich>=13.7",
 ]
 
 [project.optional-dependencies]

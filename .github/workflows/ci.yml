@@ -21,9 +21,9 @@ jobs:
       - run: pytest -q
 
   sitl:
-    name: SITL heartbeat
+    name: SITL heartbeat, flight and watchdog
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,7 +33,9 @@ jobs:
       - run: pip install -e ".[dev,sitl]"
       - name: Start ArduCopter SITL + MAVProxy
         run: ./scripts/sitl.sh --background
-      - name: Heartbeat within 5 s, mode and battery logged
+      # Phase 0: heartbeat within 5 s. Phase 1: state matches an independent
+      # reader, take off and circle, record and replay, freeze SITL -> link_lost.
+      - name: SITL tests
         run: QC_SITL=1 pytest -q -m sitl
       - name: SITL logs
         if: always()
