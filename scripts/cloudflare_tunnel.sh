@@ -87,14 +87,19 @@ do_create() {
     "$ROOT/deploy/cloudflared/config.yml.template" | sudo tee /etc/cloudflared/config.yml >/dev/null
   sudo cloudflared --config /etc/cloudflared/config.yml ingress validate
 
-  if systemctl cat cloudflared.service >/dev/null 2>&1; then
-    sudo systemctl restart cloudflared
-  else
-    sudo cloudflared --config /etc/cloudflared/config.yml service install
-  fi
-  sudo systemctl enable --now cloudflared
-  sleep 3
+  # Our own unit file: `cloudflared service install` did not reliably create one.
+  sudo install -m 0644 "$ROOT/deploy/cloudflared/cloudflared.service" \
+    /etc/systemd/system/cloudflared.service
+  sudo systemctl daemon-reload
+  sudo systemctl enable cloudflared
+  sudo systemctl restart cloudflared
+  sleep 5
   systemctl --no-pager --lines=5 status cloudflared || true
+  if ! systemctl is-active --quiet cloudflared; then
+    echo "cloudflared is not running. See: sudo journalctl -u cloudflared -n 30" >&2
+    exit 1
+  fi
+  cloudflared tunnel info "$NAME" || true
 
   cat <<MSG
 

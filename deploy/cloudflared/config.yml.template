@@ -1,5 +1,5 @@
 # Rendered to /etc/cloudflared/config.yml by scripts/cloudflare_tunnel.sh.
-# @TUNNEL_ID@, @SSH_HOST@ and @DASH_HOST@ are filled in by the script.
+# The tunnel id and hostnames below are filled in by the script.
 tunnel: @TUNNEL_ID@
 credentials-file: /etc/cloudflared/@TUNNEL_ID@.json
 
