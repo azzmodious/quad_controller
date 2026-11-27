@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# Local config overrides and logs
+config/local.yaml
+logs/
+
+# SITL working files
+.sitl/
+eeprom.bin
+mav.parm
+mav.tlog*
+terrain/
+
+# Cloudflare tunnel credentials must never be committed
+*.json.cred
+deploy/cloudflared/*.json

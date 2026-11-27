@@ -1,0 +1,40 @@
+# Default configuration for quad_controller.
+#
+# Copy this file to config/local.yaml (git-ignored) and change what you need,
+# or point QC_CONFIG at another file. Values in local.yaml are merged on top of
+# these defaults. The --target and --connection CLI flags win over both.
+
+# Which entry under `targets` to use when --target is not given.
+target: sitl
+
+targets:
+  sitl:
+    # scripts/sitl.sh runs MAVProxy, which forwards SITL to this UDP port.
+    # Without MAVProxy, use tcp:127.0.0.1:5760 to talk to SITL directly.
+    connection: "udpin:127.0.0.1:14550"
+    baud: 115200  # ignored for network links
+  hardware:
+    # Pixhawk TELEM2 wired to the Pi 5 GPIO14/15 UART (see docs/hardware/wiring.md).
+    connection: "/dev/ttyAMA0"
+    baud: 921600
+
+mavlink:
+  # How we identify ourselves on the MAVLink network.
+  source_system: 1
+  source_component: 191   # MAV_COMP_ID_ONBOARD_COMPUTER
+  heartbeat_timeout_s: 5.0
+  status_interval_s: 2.0  # how often `quadctl run` logs a status line
+
+logging:
+  # Empty dir means: /var/log/quad_controller when it is writable (the Pi service),
+  # otherwise ~/.local/state/quad_controller/logs.
+  dir: ""
+  level: INFO
+  max_bytes: 5242880   # 5 MB per file
+  backup_count: 10
+  console: true
+
+safety:
+  # Phase 0 code never arms or sends mode changes. This flag exists now so that
+  # later phases have one place to check. Leave false until Phase 5 passes.
+  allow_real_aircraft_arming: false
