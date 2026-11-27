@@ -189,6 +189,8 @@ def collect_firmware_info(conn, wait_s: float) -> dict:
 
     info: dict = {"banner": []}
     ml.request_message(conn, ml.mavlink.MAVLINK_MSG_ID_AUTOPILOT_VERSION)
+    # ArduCopter before 4.0 ignores REQUEST_MESSAGE; it answers this older command.
+    ml.command_long(conn, ml.mavlink.MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES, 1)
     ml.command_long(conn, ml.MAV_CMD_DO_SEND_BANNER)
     deadline = time.monotonic() + wait_s
     while time.monotonic() < deadline:
