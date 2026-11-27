@@ -25,7 +25,9 @@ def free_udp_port() -> int:
 
 
 class FakeAutopilot:
-    def __init__(self, port: int, rate_hz: float = 10.0) -> None:
+    def __init__(self, port: int, rate_hz: float = 10.0, legacy: bool = False) -> None:
+        # legacy=True behaves like ArduCopter 3.6: no MAV_CMD_REQUEST_MESSAGE support.
+        self.legacy = legacy
         self.conn = mavutil.mavlink_connection(
             f"udpout:127.0.0.1:{port}", source_system=1, source_component=1
         )
@@ -62,7 +64,12 @@ class FakeAutopilot:
     def _on_command(self, msg) -> None:
         self.commands.append(msg.command)
         mav = self.conn.mav
-        if msg.command == mavlink.MAV_CMD_REQUEST_MESSAGE and int(msg.param1) == 148:
+        wants_version = (
+            msg.command == mavlink.MAV_CMD_REQUEST_MESSAGE and int(msg.param1) == 148
+        ) and not self.legacy
+        if self.legacy and msg.command == mavlink.MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES:
+            wants_version = True
+        if wants_version:
             mav.autopilot_version_send(
                 capabilities=0xFFFF,
                 flight_sw_version=(4 << 24) | (5 << 16) | (7 << 8) | 255,

@@ -66,6 +66,17 @@ def test_firmware_info(log_dir, capsys):
     assert info["flash_hint"].startswith("2 MB")
 
 
+def test_firmware_info_on_arducopter_36(log_dir, capsys):
+    """Pre-4.0 firmware only answers MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES."""
+    port = free_udp_port()
+    with FakeAutopilot(port, legacy=True):
+        rc = main(
+            ["firmware-info", "--connection", f"udpin:127.0.0.1:{port}", "--wait", "2", "--json"]
+        )
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["firmware_version"] == "4.5.7-official"
+
+
 def test_helpers():
     assert decode_sw_version((4 << 24) | (6 << 16) | (0 << 8) | 192) == "4.6.0-rc"
     assert flash_hint(["ArduCopter V4.5.7", "Pixhawk1-1M 003A0029"]).startswith("1 MB")
