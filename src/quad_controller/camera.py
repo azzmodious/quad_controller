@@ -67,6 +67,19 @@ def find_camera_binary() -> str | None:
     return shutil.which("rpicam-vid") or shutil.which("libcamera-vid")
 
 
+NOIR_TUNING = [
+    "/usr/share/libcamera/ipa/rpi/pisp/ov5647_noir.json",  # Pi 5
+    "/usr/share/libcamera/ipa/rpi/vc4/ov5647_noir.json",  # Pi 4 and earlier
+]
+
+
+def noir_tuning_file() -> str | None:
+    """The NoIR OV5647 tuning file for this Pi, if installed."""
+    from pathlib import Path
+
+    return next((p for p in NOIR_TUNING if Path(p).exists()), None)
+
+
 class RpicamSource:
     """Runs rpicam-vid and yields JPEG frames until stopped or the process exits."""
 
@@ -79,10 +92,14 @@ class RpicamSource:
         hflip: bool = False,
         vflip: bool = False,
         binary: str | None = None,
+        awb: str | None = None,
+        awbgains: str | None = None,
+        tuning_file: str | None = None,
     ) -> None:
         self.width, self.height, self.fps, self.quality = width, height, fps, quality
         self.hflip, self.vflip = hflip, vflip
         self.binary = binary
+        self.awb, self.awbgains, self.tuning_file = awb, awbgains, tuning_file
         self._proc: subprocess.Popen | None = None
         self.stderr_tail: deque[str] = deque(maxlen=20)
 
@@ -105,6 +122,12 @@ class RpicamSource:
             cmd.append("--hflip")
         if self.vflip:
             cmd.append("--vflip")
+        if self.awb:
+            cmd += ["--awb", self.awb]
+        if self.awbgains:
+            cmd += ["--awbgains", self.awbgains]
+        if self.tuning_file:
+            cmd += ["--tuning-file", self.tuning_file]
         return cmd
 
     def frames(self) -> Iterator[bytes]:
@@ -448,6 +471,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--quality", type=int, default=80, help="JPEG quality 1-100")
     p.add_argument("--hflip", action="store_true", help="mirror left/right")
     p.add_argument("--vflip", action="store_true", help="flip upside down")
+    p.add_argument(
+        "--awb",
+        choices=["auto", "incandescent", "tungsten", "fluorescent", "indoor", "daylight", "cloudy"],
+        help="white balance mode (fixes a colour tint under some lights)",
+    )
+    p.add_argument(
+        "--awbgains", metavar="RED,BLUE", help="fixed red,blue gains, e.g. 1.5,1.2 (turns off auto)"
+    )
+    p.add_argument(
+        "--noir",
+        action="store_true",
+        help="colour profile for NoIR cameras (no infrared filter, often look blue or pink)",
+    )
+    p.add_argument("--tuning-file", help="libcamera tuning JSON (overrides --noir)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -456,7 +493,15 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     source = RpicamSource(
-        args.width, args.height, args.fps, args.quality, hflip=args.hflip, vflip=args.vflip
+        args.width,
+        args.height,
+        args.fps,
+        args.quality,
+        hflip=args.hflip,
+        vflip=args.vflip,
+        awb=args.awb,
+        awbgains=args.awbgains,
+        tuning_file=args.tuning_file or (noir_tuning_file() if args.noir else None),
     )
     if not find_camera_binary():
         log.error("rpicam-vid not found. On Raspberry Pi OS: sudo apt install rpicam-apps")
