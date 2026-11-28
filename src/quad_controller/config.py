@@ -43,6 +43,35 @@ class MavlinkConfig:
     status_interval_s: float = 2.0
 
 
+def _default_streams() -> dict[str, float]:
+    return {
+        "ATTITUDE": 20.0,
+        "GLOBAL_POSITION_INT": 5.0,
+        "GPS_RAW_INT": 2.0,
+        "SYS_STATUS": 2.0,
+        "VFR_HUD": 4.0,
+        "EKF_STATUS_REPORT": 2.0,
+        "RC_CHANNELS": 5.0,
+    }
+
+
+@dataclass(frozen=True)
+class LinkConfig:
+    """Phase 1 link layer: our heartbeat, watchdog thresholds and stream rates."""
+
+    heartbeat_hz: float = 1.0
+    degraded_after_s: float = 1.0
+    lost_after_s: float = 3.0
+    # Message name -> rate in Hz that we ask the autopilot for.
+    streams: dict[str, float] = field(default_factory=_default_streams)
+
+
+@dataclass(frozen=True)
+class RecorderConfig:
+    dir: str = ""  # empty: <log dir>/recordings
+    rate_hz: float = 10.0
+
+
 @dataclass(frozen=True)
 class LoggingConfig:
     dir: str = ""
@@ -62,6 +91,8 @@ class Config:
     target: TargetConfig
     mavlink: MavlinkConfig = field(default_factory=MavlinkConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
+    link: LinkConfig = field(default_factory=LinkConfig)
+    recorder: RecorderConfig = field(default_factory=RecorderConfig)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     sources: tuple[str, ...] = ()
 
@@ -95,6 +126,23 @@ def _section(raw: dict[str, Any], name: str, cls: type) -> Any:
     if unknown:
         raise ConfigError(f"unknown key(s) in '{name}': {', '.join(sorted(unknown))}")
     return cls(**data)
+
+
+def _link_section(raw: dict[str, Any]) -> LinkConfig:
+    data = dict(raw.get("link") or {})
+    streams = data.pop("streams", None)
+    link = _section({"link": data}, "link", LinkConfig)
+    if link.degraded_after_s >= link.lost_after_s:
+        raise ConfigError("'link.degraded_after_s' must be less than 'link.lost_after_s'")
+    if streams is None:
+        return link
+    if not isinstance(streams, dict):
+        raise ConfigError("'link.streams' must map message names to rates in Hz")
+    try:
+        rates = {str(k).upper(): float(v) for k, v in streams.items()}
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"'link.streams': {exc}") from exc
+    return LinkConfig(**{**link.__dict__, "streams": rates})
 
 
 def load_config(
@@ -138,6 +186,8 @@ def load_config(
         target=target_cfg,
         mavlink=_section(raw, "mavlink", MavlinkConfig),
         logging=_section(raw, "logging", LoggingConfig),
+        link=_link_section(raw),
+        recorder=_section(raw, "recorder", RecorderConfig),
         safety=_section(raw, "safety", SafetyConfig),
         sources=tuple(sources),
     )
