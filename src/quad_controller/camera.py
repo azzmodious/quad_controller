@@ -101,6 +101,7 @@ class RpicamSource:
         self.binary = binary
         self.awb, self.awbgains, self.tuning_file = awb, awbgains, tuning_file
         self._proc: subprocess.Popen | None = None
+        self._stderr_thread: threading.Thread | None = None
         self.stderr_tail: deque[str] = deque(maxlen=20)
 
     def command(self) -> list[str]:
@@ -136,7 +137,10 @@ class RpicamSource:
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
         )
-        threading.Thread(target=self._drain_stderr, args=(self._proc,), daemon=True).start()
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, args=(self._proc,), daemon=True
+        )
+        self._stderr_thread.start()
         try:
             yield from split_jpegs(self._proc.stdout)
         finally:
@@ -157,6 +161,9 @@ class RpicamSource:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        # Let the stderr reader catch the process's last words for last_error().
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=1)
 
     def last_error(self) -> str:
         """The most useful recent stderr line, for the status page."""
@@ -184,6 +191,7 @@ class FrameHub:
         self._last_release = time.monotonic()
         self._thread: threading.Thread | None = None
         self._stamps: deque[float] = deque(maxlen=30)
+        self._failures = 0  # camera runs that ended without a frame
         self.error = ""
         self.started_at: float | None = None
 
@@ -201,12 +209,17 @@ class FrameHub:
             self._last_release = time.monotonic()
 
     def wait_frame(self, after_seq: int, timeout: float) -> tuple[int, bytes] | None:
-        """Block until a frame newer than `after_seq` arrives; None on timeout."""
+        """Block until a frame newer than `after_seq` arrives.
+
+        Returns None on timeout, or as soon as a camera start fails, so a viewer
+        sees the error at once instead of waiting out the timeout.
+        """
         deadline = time.monotonic() + timeout
         with self._cond:
+            failures = self._failures
             while self._seq <= after_seq:
                 left = deadline - time.monotonic()
-                if left <= 0:
+                if left <= 0 or self._failures != failures:
                     return None
                 self._cond.wait(left)
             return self._seq, self._frame
@@ -259,6 +272,10 @@ class FrameHub:
                     stop()
             if self.error:
                 log.warning("camera: %s", self.error)
+            if not got_frame:
+                with self._cond:
+                    self._failures += 1
+                    self._cond.notify_all()
             if not got_frame and not self._idle():
                 time.sleep(self.retry_s)
         log.info("camera stopped (no viewers)")
