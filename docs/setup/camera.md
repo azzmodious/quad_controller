@@ -31,6 +31,27 @@ Ctrl+C in the SSH tab stops it. Useful flags: `--width 640 --height 480`
 The camera only runs while a page is open. It starts on the first viewer and
 stops five seconds after the last one leaves.
 
+## Colour
+
+The easiest fix for a colour tint is on the page itself, in the **Colour** panel:
+
+1. Point the camera at something white or light grey, click **Tap white to
+   balance**, then tap that object in the picture. The red and blue gains are
+   set so it comes out neutral. Tap again to fine-tune.
+2. Or turn off **Automatic white balance** and drag **Red** and **Blue**. A blue
+   picture needs more red or less blue.
+3. Click **Save as default**. Settings are saved to
+   `~/.config/quad_controller/camera.json` and used every time the camera
+   starts. Command-line flags still win over the saved file.
+
+Each change restarts the camera, so the picture pauses for about a second.
+
+From the command line instead:
+
+- `--awbgains RED,BLUE`, e.g. `--awbgains 1.6,1.4`: fixed gains.
+- `--awb indoor` (or tungsten, daylight, ...): a white balance preset.
+- `--noir`: colour profile for NoIR cameras (no infrared filter).
+
 ## Troubleshooting
 
 - **"Pipeline handler in use by another process"**: something else holds the

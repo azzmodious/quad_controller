@@ -24,8 +24,10 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
+from dataclasses import asdict, dataclass, fields
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import BinaryIO
 
 log = logging.getLogger("quad_controller.camera")
@@ -75,9 +77,92 @@ NOIR_TUNING = [
 
 def noir_tuning_file() -> str | None:
     """The NoIR OV5647 tuning file for this Pi, if installed."""
-    from pathlib import Path
-
     return next((p for p in NOIR_TUNING if Path(p).exists()), None)
+
+
+DEFAULT_SETTINGS_PATH = Path("~/.config/quad_controller/camera.json")
+
+# Slider ranges, shared by validation and the page.
+RANGES = {
+    "red": (0.2, 4.0),
+    "blue": (0.2, 4.0),
+    "saturation": (0.0, 2.0),
+    "brightness": (-0.5, 0.5),
+}
+
+
+@dataclass
+class ColourSettings:
+    """Picture settings the page can change live and save."""
+
+    auto_wb: bool = True  # False: use the fixed red/blue gains below
+    red: float = 1.5
+    blue: float = 1.5
+    saturation: float = 1.0
+    brightness: float = 0.0
+    hflip: bool = False
+    vflip: bool = False
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ColourSettings:
+        """Build from untrusted JSON; raises ValueError on anything off."""
+        if not isinstance(data, dict):
+            raise ValueError("settings must be an object")
+        known = {f.name: f for f in fields(cls)}
+        unknown = set(data) - set(known)
+        if unknown:
+            raise ValueError(f"unknown settings: {', '.join(sorted(unknown))}")
+        out = cls()
+        for name, value in data.items():
+            default = getattr(out, name)
+            if isinstance(default, bool):
+                if not isinstance(value, bool):
+                    raise ValueError(f"{name} must be true or false")
+            else:
+                if isinstance(value, bool) or not isinstance(value, int | float):
+                    raise ValueError(f"{name} must be a number")
+                lo, hi = RANGES[name]
+                if not lo <= value <= hi:
+                    raise ValueError(f"{name} must be between {lo} and {hi}")
+                value = round(float(value), 3)
+            setattr(out, name, value)
+        return out
+
+    def args(self) -> list[str]:
+        out: list[str] = []
+        if not self.auto_wb:
+            out += ["--awbgains", f"{self.red:g},{self.blue:g}"]
+        if self.saturation != 1.0:
+            out += ["--saturation", f"{self.saturation:g}"]
+        if self.brightness != 0.0:
+            out += ["--brightness", f"{self.brightness:g}"]
+        if self.hflip:
+            out.append("--hflip")
+        if self.vflip:
+            out.append("--vflip")
+        return out
+
+
+class SettingsStore:
+    """Saves ColourSettings as JSON so they survive restarts."""
+
+    def __init__(self, path: Path | str = DEFAULT_SETTINGS_PATH) -> None:
+        self.path = Path(path).expanduser()
+
+    def load(self) -> ColourSettings | None:
+        try:
+            return ColourSettings.from_dict(json.loads(self.path.read_text()))
+        except FileNotFoundError:
+            return None
+        except (ValueError, OSError) as exc:
+            log.warning("ignoring camera settings in %s: %s", self.path, exc)
+            return None
+
+    def save(self, settings: ColourSettings) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(asdict(settings), indent=2) + "\n")
+        tmp.replace(self.path)
 
 
 class RpicamSource:
@@ -95,11 +180,19 @@ class RpicamSource:
         awb: str | None = None,
         awbgains: str | None = None,
         tuning_file: str | None = None,
+        settings: ColourSettings | None = None,
     ) -> None:
         self.width, self.height, self.fps, self.quality = width, height, fps, quality
-        self.hflip, self.vflip = hflip, vflip
         self.binary = binary
-        self.awb, self.awbgains, self.tuning_file = awb, awbgains, tuning_file
+        self.awb, self.tuning_file = awb, tuning_file
+        self.settings = settings or ColourSettings()
+        if hflip:
+            self.settings.hflip = True
+        if vflip:
+            self.settings.vflip = True
+        if awbgains:
+            red, blue = (float(x) for x in awbgains.split(","))
+            self.settings.auto_wb, self.settings.red, self.settings.blue = False, red, blue
         self._proc: subprocess.Popen | None = None
         self._stderr_thread: threading.Thread | None = None
         self.stderr_tail: deque[str] = deque(maxlen=20)
@@ -119,14 +212,9 @@ class RpicamSource:
             "--quality", str(self.quality),
             "--output", "-",
         ]  # fmt: skip
-        if self.hflip:
-            cmd.append("--hflip")
-        if self.vflip:
-            cmd.append("--vflip")
-        if self.awb:
+        if self.awb and self.settings.auto_wb:
             cmd += ["--awb", self.awb]
-        if self.awbgains:
-            cmd += ["--awbgains", self.awbgains]
+        cmd += self.settings.args()
         if self.tuning_file:
             cmd += ["--tuning-file", self.tuning_file]
         return cmd
@@ -192,6 +280,7 @@ class FrameHub:
         self._thread: threading.Thread | None = None
         self._stamps: deque[float] = deque(maxlen=30)
         self._failures = 0  # camera runs that ended without a frame
+        self._restarting = False
         self.error = ""
         self.started_at: float | None = None
 
@@ -223,6 +312,15 @@ class FrameHub:
                     return None
                 self._cond.wait(left)
             return self._seq, self._frame
+
+    def reconfigure(self, settings: ColourSettings) -> None:
+        """Apply new picture settings, restarting the camera if it is running."""
+        self.source.settings = settings
+        with self._cond:
+            running = self._thread is not None and self._thread.is_alive()
+            self._restarting = running
+        if running:
+            self.source.stop()  # the reader loop starts it again with the new settings
 
     # -- status ------------------------------------------------------------
     def status(self) -> dict:
@@ -262,8 +360,11 @@ class FrameHub:
                     if self._idle():
                         break
                 else:
-                    err = getattr(self.source, "last_error", lambda: "")()
-                    self.error = err or "camera process exited"
+                    with self._cond:
+                        restarting, self._restarting = self._restarting, False
+                    if not restarting:
+                        err = getattr(self.source, "last_error", lambda: "")()
+                        self.error = err or "camera process exited"
             except Exception as exc:  # noqa: BLE001 - report anything to the page
                 self.error = str(exc)
             finally:
@@ -311,12 +412,32 @@ button:hover, a.btn:hover { border-color:var(--accent); }
 button.on { border-color:var(--accent); color:var(--accent); }
 #err { color:var(--bad); margin-top:10px; font-size:13px; white-space:pre-wrap; }
 footer { color:var(--muted); font-size:12px; margin-top:16px; }
+.panel { background:var(--panel); border:1px solid var(--line); border-radius:10px;
+         padding:14px 16px; margin-top:16px; }
+.panel h2 { font-size:15px; margin:0; font-weight:600; }
+.head { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+#saveState { font-size:13px; color:var(--muted); margin-left:auto; }
+#saveState.dirty { color:#d29922; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(240px, 1fr)); gap:6px 24px; }
+.slider { display:grid; grid-template-columns:84px 1fr 44px; align-items:center; gap:10px;
+          min-height:36px; }
+.slider span:last-child { text-align:right; font-variant-numeric:tabular-nums; }
+.slider.off { opacity:.4; }
+input[type=range] { width:100%; accent-color:var(--accent); }
+label.check { display:flex; align-items:center; gap:8px; min-height:36px; cursor:pointer; }
+input[type=checkbox] { width:18px; height:18px; accent-color:var(--accent); }
+.hint { color:var(--muted); font-size:13px; margin:8px 0 0; }
+#picking { display:none; position:absolute; top:10px; left:50%; transform:translateX(-50%);
+           background:rgba(0,0,0,.75); padding:6px 12px; border-radius:16px; font-size:13px; }
+.view.pick { cursor:crosshair; }
+.view.pick #picking { display:block; }
 </style></head><body>
 <header><span class="dot" id="dot"></span><h1>drone01 camera</h1>
   <span id="state">connecting</span></header>
 <main>
   <div class="view" id="view"><img id="img" alt="Camera view">
-    <div id="msg">Starting camera</div></div>
+    <div id="msg">Starting camera</div>
+    <div id="picking">Tap something white or grey</div></div>
   <div class="bar">
     <button id="live" class="on">Live</button>
     <button id="slow">Low bandwidth (1 fps)</button>
@@ -324,6 +445,34 @@ footer { color:var(--muted); font-size:12px; margin-top:16px; }
     <button id="full">Full screen</button>
   </div>
   <div id="err"></div>
+  <section class="panel" id="colour">
+    <div class="head"><h2>Colour</h2><span id="saveState"></span></div>
+    <div class="grid">
+      <div>
+        <label class="check"><input type="checkbox" id="auto_wb"> Automatic white balance</label>
+        <div class="slider" id="row_red"><span>Red</span>
+          <input type="range" id="red" step="0.05"><span id="red_v"></span></div>
+        <div class="slider" id="row_blue"><span>Blue</span>
+          <input type="range" id="blue" step="0.05"><span id="blue_v"></span></div>
+      </div>
+      <div>
+        <div class="slider"><span>Saturation</span>
+          <input type="range" id="saturation" step="0.05"><span id="saturation_v"></span></div>
+        <div class="slider"><span>Brightness</span>
+          <input type="range" id="brightness" step="0.02"><span id="brightness_v"></span></div>
+        <label class="check"><input type="checkbox" id="hflip"> Mirror left/right</label>
+        <label class="check"><input type="checkbox" id="vflip"> Flip upside down</label>
+      </div>
+    </div>
+    <div class="bar">
+      <button id="pick">Tap white to balance</button>
+      <button id="save">Save as default</button>
+      <button id="revert">Back to saved</button>
+      <button id="defaults">Reset</button>
+    </div>
+    <p class="hint">Blue picture: raise Red or lower Blue. Orange picture: the opposite.
+      Each change restarts the camera, so the picture pauses for about a second.</p>
+  </section>
   <footer>Phase 3 preview. The camera turns off a few seconds after you close this page.</footer>
 </main>
 <script>
@@ -365,14 +514,112 @@ async function poll() {
         + `${s.viewers} viewer${s.viewers === 1 ? '' : 's'}`
       : (s.running ? 'starting' : 'idle');
     document.getElementById('err').textContent = s.error ? 'Camera: ' + s.error : '';
+    if (s.width && s.height) document.getElementById('view').style.aspectRatio =
+      s.width + '/' + s.height;
   } catch (e) { document.getElementById('state').textContent = 'server unreachable'; }
 }
-start(); poll(); setInterval(poll, 2000);
+
+// ---- colour settings ------------------------------------------------------
+const NUM = ['red', 'blue', 'saturation', 'brightness'], BOOL = ['auto_wb', 'hflip', 'vflip'];
+const DEFAULTS = {auto_wb: true, red: 1.5, blue: 1.5, saturation: 1, brightness: 0,
+                  hflip: false, vflip: false};
+const $ = id => document.getElementById(id);
+let cur = null, saved = null, sendTimer = null;
+function same(a, b) { return !!a && !!b && JSON.stringify(a) === JSON.stringify(b); }
+function show(s) {
+  cur = {...s};
+  for (const k of NUM) { $(k).value = s[k]; $(k + '_v').textContent = (+s[k]).toFixed(2); }
+  for (const k of BOOL) $(k).checked = s[k];
+  for (const k of ['red', 'blue']) {
+    $('row_' + k).classList.toggle('off', s.auto_wb); $(k).disabled = s.auto_wb;
+  }
+  const st = $('saveState');
+  const isSaved = same(cur, saved);
+  st.textContent = isSaved ? 'Saved' : saved ? 'Unsaved changes' : 'Not saved yet';
+  st.classList.toggle('dirty', !isSaved);
+}
+function read() {
+  const s = {};
+  for (const k of NUM) s[k] = parseFloat($(k).value);
+  for (const k of BOOL) s[k] = $(k).checked;
+  return s;
+}
+async function send(s, save = false) {
+  try {
+    const r = await fetch('settings.json', {method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({settings: s, save})});
+    const doc = await r.json();
+    if (!r.ok) throw new Error(doc.error || r.status);
+    saved = doc.saved; show(doc.current); $('err').textContent = '';
+  } catch (e) { $('err').textContent = 'Settings: ' + e.message; }
+}
+function queue() {
+  show(read()); clearTimeout(sendTimer); sendTimer = setTimeout(() => send(read()), 350);
+}
+for (const k of NUM) {
+  $(k).addEventListener('input', () => { $(k + '_v').textContent = (+$(k).value).toFixed(2); });
+  $(k).addEventListener('change', queue);
+}
+for (const k of BOOL) $(k).addEventListener('change', queue);
+$('save').onclick = () => send(read(), true);
+$('revert').onclick = () => saved && send(saved);
+$('defaults').onclick = () => send(DEFAULTS);
+async function loadSettings() {
+  const doc = await (await fetch('settings.json', {cache: 'no-store'})).json();
+  for (const k of NUM) { $(k).min = doc.ranges[k][0]; $(k).max = doc.ranges[k][1]; }
+  saved = doc.saved; show(doc.current);
+  if (!doc.can_save) { $('save').disabled = $('revert').disabled = true; }
+}
+
+// Tap a white or grey object: scale the gains so its red and blue match green.
+$('pick').onclick = async () => {
+  if (cur.auto_wb) {
+    await send({...cur, auto_wb: false});
+    $('err').textContent = '';
+  }
+  $('view').classList.toggle('pick');
+};
+$('view').addEventListener('click', async e => {
+  if (!$('view').classList.contains('pick')) return;
+  $('view').classList.remove('pick');
+  try {
+    const bmp = await createImageBitmap(await (await fetch('snapshot.jpg?t=' + Date.now())).blob());
+    const box = img.getBoundingClientRect();
+    const scale = Math.min(box.width / bmp.width, box.height / bmp.height);
+    const x = (e.clientX - box.left - (box.width - bmp.width * scale) / 2) / scale;
+    const y = (e.clientY - box.top - (box.height - bmp.height * scale) / 2) / scale;
+    if (x < 0 || y < 0 || x >= bmp.width || y >= bmp.height) return;
+    const c = document.createElement('canvas'); c.width = bmp.width; c.height = bmp.height;
+    const ctx = c.getContext('2d'); ctx.drawImage(bmp, 0, 0);
+    const px = Math.max(0, Math.round(x) - 8), py = Math.max(0, Math.round(y) - 8);
+    const d = ctx.getImageData(px, py, 17, 17).data;
+    let R = 0, G = 0, B = 0;
+    for (let i = 0; i < d.length; i += 4) { R += d[i]; G += d[i + 1]; B += d[i + 2]; }
+    if (G / (d.length / 4) < 20 || R === 0 || B === 0) {
+      $('err').textContent = 'That spot is too dark. Tap something brighter.'; return; }
+    const [lo, hi] = [0.2, 4.0], clamp = v => Math.min(hi, Math.max(lo, +v.toFixed(2)));
+    const red = clamp(cur.red * G / R), blue = clamp(cur.blue * G / B);
+    await send({...cur, auto_wb: false, red, blue});
+  } catch (err) { $('err').textContent = 'Could not read the picture: ' + err.message; }
+});
+
+start(); poll(); setInterval(poll, 2000); loadSettings();
 </script></body></html>
 """
 
 
-def make_handler(hub: FrameHub, frame_timeout: float = 10.0) -> type[BaseHTTPRequestHandler]:
+def make_handler(
+    hub: FrameHub, store: SettingsStore | None = None, frame_timeout: float = 10.0
+) -> type[BaseHTTPRequestHandler]:
+    def settings_doc() -> dict:
+        saved = store.load() if store else None
+        return {
+            "current": asdict(hub.source.settings),
+            "saved": asdict(saved) if saved else None,
+            "can_save": store is not None,
+            "ranges": RANGES,
+        }
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "quad-camera/0.1"
 
@@ -413,6 +660,7 @@ def make_handler(hub: FrameHub, frame_timeout: float = 10.0) -> type[BaseHTTPReq
                 "/camera/status.json": lambda: self._send(
                     HTTPStatus.OK, json.dumps(hub.status()).encode(), "application/json"
                 ),
+                "/camera/settings.json": lambda: self._json(HTTPStatus.OK, settings_doc()),
                 "/healthz": lambda: self._send(HTTPStatus.OK, b"ok\n", "text/plain"),
             }
             route = routes.get(path)
@@ -420,6 +668,38 @@ def make_handler(hub: FrameHub, frame_timeout: float = 10.0) -> type[BaseHTTPReq
                 self._send(HTTPStatus.NOT_FOUND, b"not found\n", "text/plain")
             else:
                 route()
+
+        def _json(self, code: int, doc: dict) -> None:
+            self._send(code, json.dumps(doc).encode(), "application/json")
+
+        def do_POST(self) -> None:  # noqa: N802
+            """POST /camera/settings.json {"settings": {...}, "save": bool}"""
+            if self.path.split("?", 1)[0] != "/camera/settings.json":
+                self._send(HTTPStatus.NOT_FOUND, b"not found\n", "text/plain")
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= 4096:
+                    raise ValueError("body missing or too large")
+                body = json.loads(self.rfile.read(length))
+                if not isinstance(body, dict):
+                    raise ValueError("body must be an object")
+                settings = ColourSettings.from_dict(body.get("settings", {}))
+                save = body.get("save") is True
+                if save and store is None:
+                    raise ValueError("saving is turned off (--no-save)")
+            except ValueError as exc:  # json.JSONDecodeError is a ValueError
+                self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                return
+            hub.reconfigure(settings)
+            if save:
+                try:
+                    store.save(settings)
+                except OSError as exc:
+                    self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"save failed: {exc}"})
+                    return
+                log.info("camera settings saved to %s", store.path)
+            self._json(HTTPStatus.OK, settings_doc())
 
         def _snapshot(self) -> None:
             hub.acquire()
@@ -468,8 +748,10 @@ def make_handler(hub: FrameHub, frame_timeout: float = 10.0) -> type[BaseHTTPReq
     return Handler
 
 
-def serve(hub: FrameHub, host: str, port: int) -> ThreadingHTTPServer:
-    httpd = ThreadingHTTPServer((host, port), make_handler(hub))
+def serve(
+    hub: FrameHub, host: str, port: int, store: SettingsStore | None = None
+) -> ThreadingHTTPServer:
+    httpd = ThreadingHTTPServer((host, port), make_handler(hub, store))
     httpd.daemon_threads = True
     return httpd
 
@@ -502,6 +784,12 @@ def main(argv: list[str] | None = None) -> int:
         help="colour profile for NoIR cameras (no infrared filter, often look blue or pink)",
     )
     p.add_argument("--tuning-file", help="libcamera tuning JSON (overrides --noir)")
+    p.add_argument(
+        "--settings",
+        default=str(DEFAULT_SETTINGS_PATH),
+        help="where the page saves colour settings (default: %(default)s)",
+    )
+    p.add_argument("--no-save", action="store_true", help="don't load or save settings")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -509,6 +797,10 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
     )
+    store = None if args.no_save else SettingsStore(args.settings)
+    saved = store.load() if store else None
+    if saved:
+        log.info("using saved camera settings from %s", store.path)
     source = RpicamSource(
         args.width,
         args.height,
@@ -519,13 +811,14 @@ def main(argv: list[str] | None = None) -> int:
         awb=args.awb,
         awbgains=args.awbgains,
         tuning_file=args.tuning_file or (noir_tuning_file() if args.noir else None),
+        settings=saved,
     )
     if not find_camera_binary():
         log.error("rpicam-vid not found. On Raspberry Pi OS: sudo apt install rpicam-apps")
         return 1
     hub = FrameHub(source)
     try:
-        httpd = serve(hub, args.host, args.port)
+        httpd = serve(hub, args.host, args.port, store)
     except OSError as exc:
         log.error("cannot listen on %s:%d: %s", args.host, args.port, exc)
         return 1

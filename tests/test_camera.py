@@ -3,16 +3,26 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import stat
 import sys
 import threading
 import time
 import urllib.request
+from pathlib import Path
 
 import pytest
 
-from quad_controller.camera import BOUNDARY, FrameHub, RpicamSource, serve, split_jpegs
+from quad_controller.camera import (
+    BOUNDARY,
+    ColourSettings,
+    FrameHub,
+    RpicamSource,
+    SettingsStore,
+    serve,
+    split_jpegs,
+)
 
 
 def fake_jpeg(n: int) -> bytes:
@@ -132,11 +142,104 @@ def test_camera_without_slash_redirects(server):
 
 
 def test_colour_options_reach_rpicam():
-    cmd = RpicamSource(
-        binary="rpicam-vid", awb="indoor", awbgains="1.5,1.2", tuning_file="/x/noir.json"
-    ).command()
-    joined = " ".join(cmd)
+    joined = " ".join(
+        RpicamSource(binary="rpicam-vid", awb="indoor", tuning_file="/x/noir.json").command()
+    )
     assert "--awb indoor" in joined
-    assert "--awbgains 1.5,1.2" in joined
     assert "--tuning-file /x/noir.json" in joined
+    # Fixed gains replace the white balance mode.
+    joined = " ".join(RpicamSource(binary="rpicam-vid", awb="indoor", awbgains="1.5,1.2").command())
+    assert "--awbgains 1.5,1.2" in joined and "--awb " not in joined
     assert "--awb" not in " ".join(RpicamSource(binary="rpicam-vid").command())
+
+
+# -- colour settings ---------------------------------------------------------
+
+
+def test_settings_validation():
+    s = ColourSettings.from_dict({"auto_wb": False, "red": 1.7, "blue": 1.3})
+    assert s.args() == ["--awbgains", "1.7,1.3"]
+    assert ColourSettings().args() == []  # defaults add nothing to the command
+    for bad in (
+        {"red": 99},
+        {"red": "1.5"},
+        {"auto_wb": 1},
+        {"hflip": "yes"},
+        {"shutter": 100},
+        [],
+    ):
+        with pytest.raises(ValueError):
+            ColourSettings.from_dict(bad)
+
+
+def test_settings_store_round_trip(tmp_path):
+    store = SettingsStore(tmp_path / "sub" / "camera.json")
+    assert store.load() is None
+    s = ColourSettings(auto_wb=False, red=1.6, blue=1.4, vflip=True)
+    store.save(s)
+    assert store.load() == s
+    store.path.write_text("not json")
+    assert store.load() is None  # a broken file is ignored, not fatal
+
+
+ARGV_RPICAM = """#!{python}
+import sys, time
+open(sys.argv[0] + ".args", "a").write(" ".join(sys.argv[1:]) + "\\n")
+out = sys.stdout.buffer
+while True:
+    out.write(b"\\xff\\xd8" + b"x" * 500 + b"\\xff\\xd9")
+    out.flush()
+    time.sleep(0.02)
+"""
+
+
+def _post(url, doc):
+    req = urllib.request.Request(
+        url, data=json.dumps(doc).encode(), headers={"Content-Type": "application/json"}
+    )
+    return urllib.request.urlopen(req, timeout=10)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="fake camera is a shell-style script")
+def test_settings_apply_live_and_save(tmp_path):
+    binary = _script(tmp_path, "rpicam-vid", ARGV_RPICAM)
+    store = SettingsStore(tmp_path / "camera.json")
+    source = RpicamSource(binary=binary)
+    hub = FrameHub(source, idle_s=0.3, retry_s=0.2)
+    httpd = serve(hub, "127.0.0.1", 0, store)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{httpd.server_address[1]}/camera"
+    try:
+        doc = json.load(urllib.request.urlopen(base + "/settings.json"))
+        assert doc["current"]["auto_wb"] is True and doc["saved"] is None
+        assert doc["ranges"]["red"] == [0.2, 4.0]
+
+        # Keep a stream open so the camera is running, then change the gains.
+        with urllib.request.urlopen(base + "/stream.mjpg", timeout=10) as stream:
+            stream.read1(100)
+            new = {"auto_wb": False, "red": 1.6, "blue": 1.4}
+            doc = json.load(_post(base + "/settings.json", {"settings": new}))
+            assert doc["current"]["red"] == 1.6 and doc["saved"] is None
+            # The stream survives the camera restart.
+            data = b""
+            deadline = time.monotonic() + 5
+            while data.count(b"\xff\xd9") < 5 and time.monotonic() < deadline:
+                data += stream.read1(65536)
+            assert data.count(b"\xff\xd9") >= 5
+        runs = Path(binary + ".args").read_text().splitlines()
+        assert len(runs) >= 2
+        assert "--awbgains 1.6,1.4" in runs[-1] and "--awbgains" not in runs[0]
+        assert hub.error == ""
+
+        doc = json.load(_post(base + "/settings.json", {"settings": new, "save": True}))
+        assert doc["saved"] == doc["current"]
+        assert store.load() == ColourSettings(auto_wb=False, red=1.6, blue=1.4)
+
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post(base + "/settings.json", {"settings": {"red": 50}})
+        assert exc.value.code == 400
+        assert "red must be between" in json.load(exc.value)["error"]
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        source.stop()
