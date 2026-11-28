@@ -129,3 +129,14 @@ def test_camera_without_slash_redirects(server):
     opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler)
     with opener.open(req) as r:  # follows to /camera/
         assert r.geturl().endswith("/camera/")
+
+
+def test_colour_options_reach_rpicam():
+    cmd = RpicamSource(
+        binary="rpicam-vid", awb="indoor", awbgains="1.5,1.2", tuning_file="/x/noir.json"
+    ).command()
+    joined = " ".join(cmd)
+    assert "--awb indoor" in joined
+    assert "--awbgains 1.5,1.2" in joined
+    assert "--tuning-file /x/noir.json" in joined
+    assert "--awb" not in " ".join(RpicamSource(binary="rpicam-vid").command())

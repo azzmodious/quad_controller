@@ -67,6 +67,19 @@ def find_camera_binary() -> str | None:
     return shutil.which("rpicam-vid") or shutil.which("libcamera-vid")
 
 
+NOIR_TUNING = [
+    "/usr/share/libcamera/ipa/rpi/pisp/ov5647_noir.json",  # Pi 5
+    "/usr/share/libcamera/ipa/rpi/vc4/ov5647_noir.json",  # Pi 4 and earlier
+]
+
+
+def noir_tuning_file() -> str | None:
+    """The NoIR OV5647 tuning file for this Pi, if installed."""
+    from pathlib import Path
+
+    return next((p for p in NOIR_TUNING if Path(p).exists()), None)
+
+
 class RpicamSource:
     """Runs rpicam-vid and yields JPEG frames until stopped or the process exits."""
 
@@ -79,11 +92,16 @@ class RpicamSource:
         hflip: bool = False,
         vflip: bool = False,
         binary: str | None = None,
+        awb: str | None = None,
+        awbgains: str | None = None,
+        tuning_file: str | None = None,
     ) -> None:
         self.width, self.height, self.fps, self.quality = width, height, fps, quality
         self.hflip, self.vflip = hflip, vflip
         self.binary = binary
+        self.awb, self.awbgains, self.tuning_file = awb, awbgains, tuning_file
         self._proc: subprocess.Popen | None = None
+        self._stderr_thread: threading.Thread | None = None
         self.stderr_tail: deque[str] = deque(maxlen=20)
 
     def command(self) -> list[str]:
@@ -105,6 +123,12 @@ class RpicamSource:
             cmd.append("--hflip")
         if self.vflip:
             cmd.append("--vflip")
+        if self.awb:
+            cmd += ["--awb", self.awb]
+        if self.awbgains:
+            cmd += ["--awbgains", self.awbgains]
+        if self.tuning_file:
+            cmd += ["--tuning-file", self.tuning_file]
         return cmd
 
     def frames(self) -> Iterator[bytes]:
@@ -113,7 +137,10 @@ class RpicamSource:
         self._proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
         )
-        threading.Thread(target=self._drain_stderr, args=(self._proc,), daemon=True).start()
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr, args=(self._proc,), daemon=True
+        )
+        self._stderr_thread.start()
         try:
             yield from split_jpegs(self._proc.stdout)
         finally:
@@ -134,6 +161,9 @@ class RpicamSource:
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        # Let the stderr reader catch the process's last words for last_error().
+        if self._stderr_thread is not None:
+            self._stderr_thread.join(timeout=1)
 
     def last_error(self) -> str:
         """The most useful recent stderr line, for the status page."""
@@ -161,6 +191,7 @@ class FrameHub:
         self._last_release = time.monotonic()
         self._thread: threading.Thread | None = None
         self._stamps: deque[float] = deque(maxlen=30)
+        self._failures = 0  # camera runs that ended without a frame
         self.error = ""
         self.started_at: float | None = None
 
@@ -178,12 +209,17 @@ class FrameHub:
             self._last_release = time.monotonic()
 
     def wait_frame(self, after_seq: int, timeout: float) -> tuple[int, bytes] | None:
-        """Block until a frame newer than `after_seq` arrives; None on timeout."""
+        """Block until a frame newer than `after_seq` arrives.
+
+        Returns None on timeout, or as soon as a camera start fails, so a viewer
+        sees the error at once instead of waiting out the timeout.
+        """
         deadline = time.monotonic() + timeout
         with self._cond:
+            failures = self._failures
             while self._seq <= after_seq:
                 left = deadline - time.monotonic()
-                if left <= 0:
+                if left <= 0 or self._failures != failures:
                     return None
                 self._cond.wait(left)
             return self._seq, self._frame
@@ -236,6 +272,10 @@ class FrameHub:
                     stop()
             if self.error:
                 log.warning("camera: %s", self.error)
+            if not got_frame:
+                with self._cond:
+                    self._failures += 1
+                    self._cond.notify_all()
             if not got_frame and not self._idle():
                 time.sleep(self.retry_s)
         log.info("camera stopped (no viewers)")
@@ -448,6 +488,20 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--quality", type=int, default=80, help="JPEG quality 1-100")
     p.add_argument("--hflip", action="store_true", help="mirror left/right")
     p.add_argument("--vflip", action="store_true", help="flip upside down")
+    p.add_argument(
+        "--awb",
+        choices=["auto", "incandescent", "tungsten", "fluorescent", "indoor", "daylight", "cloudy"],
+        help="white balance mode (fixes a colour tint under some lights)",
+    )
+    p.add_argument(
+        "--awbgains", metavar="RED,BLUE", help="fixed red,blue gains, e.g. 1.5,1.2 (turns off auto)"
+    )
+    p.add_argument(
+        "--noir",
+        action="store_true",
+        help="colour profile for NoIR cameras (no infrared filter, often look blue or pink)",
+    )
+    p.add_argument("--tuning-file", help="libcamera tuning JSON (overrides --noir)")
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args(argv)
 
@@ -456,7 +510,15 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
     source = RpicamSource(
-        args.width, args.height, args.fps, args.quality, hflip=args.hflip, vflip=args.vflip
+        args.width,
+        args.height,
+        args.fps,
+        args.quality,
+        hflip=args.hflip,
+        vflip=args.vflip,
+        awb=args.awb,
+        awbgains=args.awbgains,
+        tuning_file=args.tuning_file or (noir_tuning_file() if args.noir else None),
     )
     if not find_camera_binary():
         log.error("rpicam-vid not found. On Raspberry Pi OS: sudo apt install rpicam-apps")
